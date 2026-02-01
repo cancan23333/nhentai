@@ -23,11 +23,11 @@ MAX_FIELD_LENGTH = 100
 EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.webp')
 
 def get_headers():
-"""返回请求头"""
-return {
-'Referer': constant.LOGIN_URL,
-'User-Agent': constant.CONFIG['useragent'],
-'Cookie': constant.CONFIG['cookie'],
+    """返回请求头"""
+    return {
+        'Referer': constant.LOGIN_URL,
+        'User-Agent': constant.CONFIG['useragent'],
+        'Cookie': constant.CONFIG['cookie'],
 }
 
 def request(method, url, **kwargs):
