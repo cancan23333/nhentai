@@ -10,7 +10,6 @@ import nhentai.constant as constant
 from nhentai.utils import request
 from nhentai.logger import logger
 
-
 def _get_csrf_token(content):
     html = BeautifulSoup(content, 'html.parser')
     csrf_token_elem = html.find('input', attrs={'name': 'csrfmiddlewaretoken'})
@@ -163,11 +162,17 @@ def doujinshi_parser(id_, counter=0):
     doujinshi['favorite_counts'] = int(favorite_counts) if favorite_counts and favorite_counts.isdigit() else 0
 
     doujinshi_cover = html.find('div', attrs={'id': 'cover'})
-    # img_id = re.search('/galleries/([0-9]+)/cover.(jpg|png|gif|webp)$',
-    #                   doujinshi_cover.a.img.attrs['data-src'])
+    # 尝试从 data-src 获取，如果不存在则从 src 获取
+    img_url = doujinshi_cover.a.img.get('data-src') or doujinshi_cover.a.img.get('src')
+    
+    # 更加宽容的正则：只要包含 /galleries/数字/ 即可
+    img_id = re.search(r'/galleries/(\d+)/', img_url)
+    
+    if not img_id:
+        logger.critical(f'Tried to get image id failed of id: {id_}. URL was: {img_url}')
+        return None
 
-    # fix cover.webp.webp
-    img_id = re.search(r'/galleries/(\d+)/cover(\.webp|\.jpg|\.png)?\.\w+$', doujinshi_cover.a.img.attrs['data-src'])
+    doujinshi['img_id'] = img_id.group(1)
 
     ext = []
     for i in html.find_all('div', attrs={'class': 'thumb-container'}):
@@ -204,16 +209,51 @@ def doujinshi_parser(id_, counter=0):
     time_field = doujinshi_info.find('time')
     if time_field.has_attr('datetime'):
         doujinshi['date'] = time_field['datetime']
+    html = BeautifulSoup(response, 'html.parser')
+    # 调试用：把抓到的内容存下来，看是不是被 Cloudflare 挡住了
+    with open('debug.html', 'wb') as f: f.write(response)
     return doujinshi
 
-
 def print_doujinshi(doujinshi_list):
+    """Print doujinshi with tabulate"""
     if not doujinshi_list:
         return
+    
     doujinshi_list = [(i['id'], i['title']) for i in doujinshi_list]
     headers = ['id', 'doujinshi']
-    logger.info(f'Search Result || Found {doujinshi_list.__len__()} doujinshis')
-    print(tabulate(tabular_data=doujinshi_list, headers=headers, tablefmt='rst'))
+    logger.info(f'Search Result || Found {len(doujinshi_list)} doujinshis')
+    
+    # 生成表格文本
+    table_text = tabulate(tabular_data=doujinshi_list, headers=headers, tablefmt='rst')
+    
+    # 原版输出
+    try:
+        print(table_text)
+    except UnicodeEncodeError:
+        try:
+            cleaned_text = table_text.replace('\xa0', ' ')
+            print(cleaned_text.encode('gbk', errors='replace').decode('gbk', errors='replace'))
+        except:
+            print(f"Found {len(doujinshi_list)} results")
+    
+    # 保存纯ID到文件（兼容性最好）
+    try:
+        # ID都是数字，用GBK编码完全没问题
+        ids = [str(item[0]) for item in doujinshi_list]
+        
+        # 使用GBK编码确保Windows兼容
+        with open('log.txt', 'w', encoding='gbk') as f:
+            f.write('\n'.join(ids))
+        
+        print(f"\n[IDs saved to log.txt: {len(ids)} IDs]")
+    except Exception as e:
+        # 如果GBK失败，尝试ASCII
+        try:
+            with open('log.txt', 'w') as f:
+                f.write('\n'.join(ids))
+            print(f"\n[IDs saved to log.txt (ASCII): {len(ids)} IDs]")
+        except:
+            print(f"\n[Failed to save IDs: {e}]")
 
 
 def legacy_search_parser(keyword, sorting, page, is_page_all=False, type_='SEARCH'):
