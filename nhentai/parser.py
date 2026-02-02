@@ -299,57 +299,47 @@ def legacy_search_parser(keyword, sorting, page, is_page_all=False, type_='SEARC
 
     return result
 
-
 def search_parser(keyword, sorting, page, is_page_all=False):
     result = []
-    response = None
     if not page:
         page = [1]
 
-    if is_page_all:
-        url = request('get', url=constant.SEARCH_URL, params={'query': keyword}).url
-        init_response = request('get', url.replace('%2B', '+')).json()
-        page = range(1, init_response['num_pages']+1)
-
-    total = f'/{page[-1]}' if is_page_all else ''
-    not_exists_persist = False
     for p in page:
         i = 0
-
-        logger.info(f'Searching doujinshis using keywords "{keyword}" on page {p}{total}')
+        logger.info(f'Searching doujinshis using keywords "{keyword}" on page {p}')
+        
         while i < constant.RETRY_TIMES:
             try:
-                url = request('get', url=constant.SEARCH_URL, params={'query': keyword,
-                                                                      'page': p, 'sort': sorting}).url
+                # 获取 URL
+                url_obj = request('get', url=constant.SEARCH_URL, params={'query': keyword, 'page': p, 'sort': sorting})
+                url = url_obj.url
 
                 if constant.DEBUG:
                     logger.debug(f'Request URL: {url}')
 
-                response = request('get', url.replace('%2B', '+')).json()
+                # 执行请求
+                resp_obj = request('get', url.replace('%2B', '+'))
+                response = resp_obj.json()
+                
+                # 如果成功获取到结果，跳出 retry 循环
+                if response and 'result' in response:
+                    for row in response['result']:
+                        title = row['title']['english']
+                        title = title[:constant.CONFIG['max_filename']] + '..' if \
+                            len(title) > constant.CONFIG['max_filename'] else title
+                        result.append({'id': row['id'], 'title': title})
+                    break  # <--- 只有成功解析数据后才 break
+                
             except Exception as e:
-                logger.critical(str(e))
-                response = None
-            break
-
-        if constant.DEBUG:
-            logger.debug(f'Response: {response}')
-
-        if response is None or 'result' not in response:
-            logger.warning(f'No result in response in page {p}')
-            if not_exists_persist is True:
-                break
-            continue
-
-        for row in response['result']:
-            title = row['title']['english']
-            title = title[:constant.CONFIG['max_filename']] + '..' if \
-                len(title) > constant.CONFIG['max_filename'] else title
-
-            result.append({'id': row['id'], 'title': title})
-
-        not_exists_persist = False
-        if not result:
-            logger.warning(f'No results for keywords {keyword}')
+                i += 1
+                logger.warning(f'Page {p} attempt {i} failed: {str(e)}')
+                if i < constant.RETRY_TIMES:
+                    time.sleep(2)  # 失败后等待 2 秒再重试
+                else:
+                    logger.error(f'Failed to fetch page {p} after {constant.RETRY_TIMES} retries.')
+        
+        # 每页抓取完后稍微歇一下，防止被反爬虫盯上
+        time.sleep(1)
 
     return result
 
