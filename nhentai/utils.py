@@ -31,13 +31,8 @@ def get_headers():
 }
 
 def request(method, url, **kwargs):
-    # 使用 impersonate 模拟浏览器指纹
     session = requests.Session(impersonate="chrome110")
     session.headers.update(get_headers())
-
-    # 显式设置超时时间（单位：秒）
-    if 'timeout' not in kwargs:
-        kwargs['timeout'] = 30 
 
     if not kwargs.get('proxies', None):
         kwargs['proxies'] = {
@@ -45,12 +40,7 @@ def request(method, url, **kwargs):
             'http': constant.CONFIG['proxy'],
         }
 
-    # 增加通用的错误捕获
-    try:
-        return getattr(session, method)(url, verify=False, **kwargs)
-    except Exception as e:
-        logger.error(f"Network error: {e}")
-        raise e
+    return getattr(session, method)(url, verify=False, **kwargs)
 
 
 async def async_request(method, url, proxy = None, **kwargs):
