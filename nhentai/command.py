@@ -10,10 +10,10 @@ from nhentai import constant
 from nhentai.cmdline import cmd_parser, banner, write_config
 from nhentai.parser import doujinshi_parser, search_parser, legacy_search_parser, print_doujinshi, favorites_parser
 from nhentai.doujinshi import Doujinshi
-from nhentai.downloader import Downloader, CompressedDownloader
+from nhentai.downloader import Downloader
 from nhentai.logger import logger
 from nhentai.constant import BASE_URL
-from nhentai.utils import generate_html, generate_doc, generate_main_html, generate_metadata, \
+from nhentai.utils import generate_html, generate_doc, generate_main_html, generate_metadata_file, \
     paging, check_cookie, signal_handler, DB, move_to_folder
 
 
@@ -80,16 +80,12 @@ def main():
 
     if options.is_save_download_history:
         with DB() as db:
-            data = set(map(int, db.get_all()))
+            data = map(int, db.get_all())
 
         doujinshi_ids = list(set(map(int, doujinshi_ids)) - set(data))
-        logger.info(f'New doujinshis account: {len(doujinshi_ids)}')
-
-    if options.zip:
-        options.is_nohtml = True
 
     if not options.is_show:
-        downloader = (CompressedDownloader if options.zip else Downloader)(path=options.output_dir, threads=options.threads,
+        downloader = Downloader(path=options.output_dir, threads=options.threads,
                                 timeout=options.timeout, delay=options.delay,
                                 exit_on_fail=options.exit_on_fail,
                                 no_filename_padding=options.no_filename_padding)
@@ -101,15 +97,17 @@ def main():
             else:
                 continue
 
-            doujinshi.downloader = downloader
+            if not options.dryrun:
+                doujinshi.downloader = downloader
 
-            if doujinshi.check_if_need_download(options):
-                doujinshi.download()
-            else:
-                logger.info(f'Skip download doujinshi because a PDF/CBZ file exists of doujinshi {doujinshi.name}')
+                if doujinshi.check_if_need_download(options):
+                    doujinshi.download()
+                else:
+                    logger.info(f'Skip download doujinshi because a PDF/CBZ file exists of doujinshi {doujinshi.name}')
+                    continue
 
             if options.generate_metadata:
-                generate_metadata(options.output_dir, doujinshi)
+                generate_metadata_file(options.output_dir, doujinshi)
 
             if options.is_save_download_history:
                 with DB() as db:
@@ -117,6 +115,9 @@ def main():
 
             if not options.is_nohtml:
                 generate_html(options.output_dir, doujinshi, template=constant.CONFIG['template'])
+
+            if not options.no_metadata:
+                generate_doc('json', options.output_dir, doujinshi, options.regenerate)
 
             if options.is_cbz:
                 generate_doc('cbz', options.output_dir, doujinshi, options.regenerate)
