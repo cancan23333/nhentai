@@ -1,44 +1,30 @@
 # coding: utf-8
 """
-为没有元数据的漫画ZIP包添加元数据
+为没有元数据的漫画ZIP包添加元数据 (增强版)
 
-独立脚本 - 无需nhentai模块
-- 从nhentai网站获取漫画元数据
-- 将元数据嵌入到ZIP文件中
-- 支持cookie、UA和proxy配置
-- 多线程处理加快速度
-- 多任务管理和选择性处理
-- 自动检测并转换ZIP内部结构
-- Debug模式用于诊断和排错
-- CBZ格式支持和ComicInfo.xml
+功能特性:
+- 自动从nhentai获取元数据并注入ZIP/CBZ
+- 支持多线程并发处理
+- 支持断点续传和任务管理
+- [新增] 支持重试失败的任务 (--retry-failed)
+- [新增] 支持安全退出 (Ctrl+C)，防止文件损坏
+- 支持转换为CBZ格式并生成ComicInfo.xml
+
+依赖安装:
+    pip install beautifulsoup4 curl-cffi
 
 使用方法:
-    # 首次使用需要配置
+    # 首次配置
     python add_manga_metadata.py --setup
 
-    # 查看所有任务
-    python add_manga_metadata.py --list-tasks
+    # 创建任务
+    python add_manga_metadata.py --folder "C:\Comics"
 
-    # 查看指定任务的详情
-    python add_manga_metadata.py --task-info <task_id>
+    # 开始任务
+    python add_manga_metadata.py --start-task <TASK_ID>
 
-    # 删除指定任务
-    python add_manga_metadata.py --delete-task <task_id>
-
-    # 开始处理指定任务
-    python add_manga_metadata.py --start-task <task_id>
-
-    # 将ZIP转换为CBZ并添加ComicInfo.xml
-    python add_manga_metadata.py --start-task <task_id> --to-cbz
-
-    # Debug模式
-    python add_manga_metadata.py --start-task <task_id> --debug
-
-    # 处理新文件夹
-    python add_manga_metadata.py --folder <路径>
-
-文件名格式: [<6位数ID>]<漫画名>.zip 或 [<6位数ID>]<漫画名>.cbz
-示例: [269215]Title of Manga.zip
+    # 重试失败的文件
+    python add_manga_metadata.py --start-task <TASK_ID> --retry-failed
 """
 
 import os
@@ -53,7 +39,7 @@ import platform
 import hashlib
 import threading
 import shutil
-import tempfile
+import signal
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -283,7 +269,6 @@ class ComicInfoGenerator:
                 except:
                     pass
             
-            # 处理列表和字符串
             def format_field(value):
                 if isinstance(value, list):
                     return ', '.join(str(v) for v in value)
@@ -461,29 +446,20 @@ class ZipStructureConverter:
                     else:
                         root_level_items.add(item_clean)
                 
-                logger.debug(f'根目录第一级项目: {root_level_items}')
-                logger.debug(f'根目录第一级项目数: {len(root_level_items)}')
-                
                 if len(root_level_items) == 1:
                     single_item = list(root_level_items)[0]
-                    
                     is_folder = any('/' in item.rstrip('/') and item.rstrip('/').split('/')[0] == single_item 
                                    for item in file_list if '/' in item)
                     
                     if is_folder:
-                        logger.debug(f'检测到嵌套结构: 根目录只有一个文件夹 "{single_item}"')
                         return 'nested', single_item
                     else:
-                        logger.debug(f'检测到扁平结构: 根目录只有一个文件 "{single_item}"')
                         return 'flat', None
                 else:
-                    logger.debug(f'检测到扁平结构: 根目录有 {len(root_level_items)} 个第一级项目')
                     return 'flat', None
         
         except Exception as e:
             logger.error(f'分析ZIP结构失败: {e}')
-            import traceback
-            logger.debug(f'错误堆栈: {traceback.format_exc()}')
             return 'unknown', None
     
     @staticmethod
@@ -492,11 +468,9 @@ class ZipStructureConverter:
             structure_type, folder_name = ZipStructureConverter.analyze_zip_structure(zip_path)
             
             if structure_type != 'nested' or not folder_name:
-                logger.debug(f'{os.path.basename(zip_path)} 已是扁平结构或无法识别')
                 return True
             
             logger.info(f'正在转换ZIP结构: {os.path.basename(zip_path)}')
-            logger.debug(f'文件夹名称: {folder_name}')
             
             temp_zip = zip_path + '.tmp'
             folder_prefix = folder_name + '/'
@@ -508,7 +482,6 @@ class ZipStructureConverter:
                             item_clean = item.rstrip('/')
                             
                             if item_clean == folder_name:
-                                logger.debug(f'  跳过文件夹: {item}')
                                 continue
                             
                             if item.startswith(folder_prefix):
@@ -517,7 +490,6 @@ class ZipStructureConverter:
                                 if new_name and not item.endswith('/'):
                                     content = zip_read.read(item)
                                     zip_write.writestr(new_name, content)
-                                    logger.debug(f'  移动: {item} -> {new_name}')
                 
                 backup_zip = zip_path + '.backup'
                 os.rename(zip_path, backup_zip)
@@ -702,6 +674,18 @@ class TaskManager:
                 pending.append(filename)
         return pending
     
+    def get_failed_files(self, task_id: str) -> List[str]:
+        """获取任务中标记为failed的文件列表"""
+        task_data = self.tasks.get(task_id)
+        if not task_data:
+            return []
+        
+        failed = []
+        for filename, file_info in task_data['files'].items():
+            if file_info['status'] == self.STATUS_FAILED:
+                failed.append(filename)
+        return failed
+    
     def export_status_log(self, task_id: str, status: str, output_file: str):
         task_data = self.tasks.get(task_id)
         if not task_data:
@@ -876,8 +860,6 @@ class MetadataParser:
         
         except Exception as e:
             logger.error(f'解析HTML时出错: {e}')
-            import traceback
-            logger.debug(f'错误堆栈: {traceback.format_exc()}')
             return None
 
 
@@ -892,6 +874,7 @@ class ZipMetadataAdder:
         self.dry_run = dry_run
         self.to_cbz = to_cbz
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
     
     def extract_id(self, filename: str) -> Optional[str]:
         match = self.FILENAME_PATTERN.match(filename)
@@ -905,48 +888,29 @@ class ZipMetadataAdder:
                 logger.debug(f'[DRY RUN] 处理: {os.path.basename(zip_path)}')
                 return True, None
             
-            logger.debug(f'步骤1: 检测ZIP结构')
             structure_type, folder_name = ZipStructureConverter.analyze_zip_structure(zip_path)
-            logger.debug(f'  结构类型: {structure_type}')
             
             if structure_type == 'nested':
-                logger.debug(f'步骤2: 转换ZIP结构 (文件夹: {folder_name})')
                 if not ZipStructureConverter.convert_nested_to_flat(zip_path):
                     logger.error('ZIP结构转换失败')
                     return False, None
-            else:
-                logger.debug(f'步骤2: 跳过 (已是扁平结构)')
             
-            logger.debug(f'步骤3-5: 处理元数据')
             temp_zip = zip_path + '.tmp'
             
             with zipfile.ZipFile(zip_path, 'r') as zip_read:
-                has_metadata = 'metadata.json' in zip_read.namelist()
-                has_comic_info = 'ComicInfo.xml' in zip_read.namelist()
-                
-                if has_metadata:
-                    logger.debug(f'  发现旧的metadata.json，将被删除')
-                
-                if has_comic_info:
-                    logger.debug(f'  发现旧的ComicInfo.xml，将被删除')
-                
                 with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zip_write:
                     for item in zip_read.namelist():
                         if item in ('metadata.json', 'ComicInfo.xml'):
-                            logger.debug(f'  删除: {item}')
                             continue
-                        
                         zip_write.writestr(item, zip_read.read(item))
                     
                     json_content = json.dumps(metadata, ensure_ascii=False, separators=(',', ':'))
                     zip_write.writestr('metadata.json', json_content.encode('utf-8'))
-                    logger.debug(f'  添加: metadata.json')
                     
                     if self.to_cbz or zip_path.lower().endswith('.cbz'):
                         comic_info_content = ComicInfoGenerator.generate_comic_info(metadata)
                         if comic_info_content:
                             zip_write.writestr('ComicInfo.xml', comic_info_content.encode('utf-8'))
-                            logger.debug(f'  添加: ComicInfo.xml')
             
             os.remove(zip_path)
             os.rename(temp_zip, zip_path)
@@ -955,18 +919,12 @@ class ZipMetadataAdder:
             if self.to_cbz and zip_path.lower().endswith('.zip'):
                 cbz_path = zip_path[:-4] + '.cbz'
                 os.rename(zip_path, cbz_path)
-                logger.debug(f'  重命名: .zip -> .cbz')
                 new_path = cbz_path
-                logger.success(f'✓ 已转换为CBZ格式')
-            else:
-                logger.debug(f'✓ ZIP文件处理完成')
             
             return True, new_path
         
         except Exception as e:
             logger.error(f'处理ZIP文件失败: {e}')
-            import traceback
-            logger.debug(f'错误堆栈: {traceback.format_exc()}')
             temp_zip = zip_path + '.tmp'
             if os.path.exists(temp_zip):
                 try:
@@ -1015,7 +973,7 @@ class ZipMetadataAdder:
                 self.task_manager.update_file_status(task_id, filename, TaskManager.STATUS_FAILED, '处理文件失败')
             return False
     
-    def process_task(self, task_id: str, num_threads: int = 5, retry_delay: float = 2.0):
+    def process_task(self, task_id: str, num_threads: int = 5, retry_delay: float = 2.0, retry_failed: bool = False):
         task_data = self.task_manager.get_task(task_id)
         
         if not task_data:
@@ -1028,34 +986,64 @@ class ZipMetadataAdder:
             logger.error(f'文件夹不存在: {folder_path}')
             return
         
-        pending_files = self.task_manager.get_pending_files(task_id)
+        if retry_failed:
+            files_to_process = self.task_manager.get_failed_files(task_id)
+            target_status_desc = "失败"
+        else:
+            files_to_process = self.task_manager.get_pending_files(task_id)
+            target_status_desc = "待处理"
         
-        if not pending_files:
-            logger.info('该任务中没有待处理的文件')
+        if not files_to_process:
+            logger.info(f'该任务中没有{target_status_desc}的文件')
             self.print_task_summary(task_id)
             return
         
         mode = "CBZ转换" if self.to_cbz else "标准处理"
         logger.info(f'开始处理任务: {task_id} ({mode})')
+        logger.info(f'模式: 处理{target_status_desc}文件')
         logger.info(f'文件夹路径: {folder_path}')
-        logger.info(f'待处理文件数: {len(pending_files)}\n')
+        logger.info(f'目标文件数: {len(files_to_process)}\n')
         
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = {}
-            
-            for idx, filename in enumerate(pending_files):
-                archive_path = folder_path / filename
-                future = executor.submit(self.process_file, task_id, str(archive_path), filename)
-                futures[future] = filename
+        # 信号处理逻辑
+        original_sigint_handler = signal.getsignal(signal.SIGINT)
+        
+        def signal_handler(sig, frame):
+            print("\n\n" + "!"*60)
+            print("收到停止信号 (Ctrl+C)")
+            print("正在停止分发新任务，请等待当前正在运行的线程结束...")
+            print("此过程可能需要几秒钟，请勿强制关闭窗口...")
+            print("!"*60 + "\n")
+            self._stop_event.set()
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        self._stop_event.clear()
+        
+        try:
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = {}
                 
-                if (idx + 1) % num_threads == 0:
-                    time.sleep(retry_delay)
-            
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f'处理异常: {e}')
+                for idx, filename in enumerate(files_to_process):
+                    if self._stop_event.is_set():
+                        logger.warning("已停止分发新任务，正在等待线程池清空...")
+                        break
+                    
+                    archive_path = folder_path / filename
+                    future = executor.submit(self.process_file, task_id, str(archive_path), filename)
+                    futures[future] = filename
+                    
+                    if (idx + 1) % num_threads == 0:
+                        time.sleep(retry_delay)
+                
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f'处理异常: {e}')
+        
+        finally:
+            signal.signal(signal.SIGINT, original_sigint_handler)
+            if self._stop_event.is_set():
+                print("\n已安全退出。未处理的文件保持原状态。")
         
         self.print_task_summary(task_id)
     
@@ -1175,6 +1163,7 @@ def main():
     parser.add_argument('--export-success', action='store_true', help='导出成功的文件')
     parser.add_argument('--export-pending', action='store_true', help='导出待处理的文件')
     parser.add_argument('--to-cbz', action='store_true', help='将ZIP转换为CBZ并添加ComicInfo.xml')
+    parser.add_argument('--retry-failed', action='store_true', help='重试任务中标记为失败的文件')
     
     args = parser.parse_args()
     
@@ -1264,7 +1253,12 @@ def main():
             mode = "CBZ转换" if args.to_cbz else "标准处理"
             print(f"\n使用 {num_threads} 个线程处理... ({mode})\n")
             
-            adder.process_task(args.start_task, num_threads=num_threads, retry_delay=args.delay)
+            adder.process_task(
+                args.start_task, 
+                num_threads=num_threads, 
+                retry_delay=args.delay,
+                retry_failed=args.retry_failed
+            )
             return
         
         parser.print_help()
