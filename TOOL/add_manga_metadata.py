@@ -782,6 +782,9 @@ class TaskManager:
         self.config = config
         self.tasks_dir = config.tasks_dir
         self.tasks = self._load_tasks()
+        self._dirty_tasks = set()  # 跟踪需要保存的任务
+        self._write_counter = 0    # 写入计数器
+        self._write_threshold = 50 # 默认每50次操作写入一次
     
     def _load_tasks(self) -> Dict:
         tasks = {}
@@ -863,12 +866,42 @@ class TaskManager:
             return False
     
     def _save_task(self, task_id: str, task_data: Dict):
+        """保存任务数据到磁盘"""
         try:
             task_file = os.path.join(self.tasks_dir, f'{task_id}.json')
             with open(task_file, 'w', encoding='utf-8') as f:
                 json.dump(task_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f'保存任务失败: {e}')
+    
+    def set_write_threshold(self, threshold: int):
+        """设置写入阈值"""
+        self._write_threshold = max(1, threshold)
+    
+    def _mark_dirty(self, task_id: str):
+        """标记任务为脏数据，需要保存"""
+        self._dirty_tasks.add(task_id)
+        self._write_counter += 1
+        
+        # 达到阈值时批量写入
+        if self._write_counter >= self._write_threshold:
+            self._flush_dirty_tasks()
+    
+    def _flush_dirty_tasks(self):
+        """刷新所有脏数据到磁盘"""
+        if not self._dirty_tasks:
+            return
+            
+        logger.debug(f'批量写入 {len(self._dirty_tasks)} 个任务到磁盘')
+        for task_id in list(self._dirty_tasks):
+            if task_id in self.tasks:
+                self._save_task(task_id, self.tasks[task_id])
+        self._dirty_tasks.clear()
+        self._write_counter = 0
+    
+    def flush_all(self):
+        """强制写入所有缓存数据"""
+        self._flush_dirty_tasks()
     
     def update_file_status(self, task_id: str, filename: str, status: str, error_msg: str = ''):
         """更新文件处理状态"""
@@ -896,7 +929,7 @@ class TaskManager:
         
         task_data['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         self.tasks[task_id] = task_data
-        self._save_task(task_id, task_data)
+        self._mark_dirty(task_id)  # 使用批量写入
     
     def update_file_translation_status(self, task_id: str, filename: str, translation_status: str, error_msg: str = ''):
         """更新文件翻译状态"""
@@ -924,8 +957,7 @@ class TaskManager:
         
         task_data['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         self.tasks[task_id] = task_data
-        self._save_task(task_id, task_data)
-        self._save_task(task_id, task_data)
+        self._mark_dirty(task_id)  # 使用批量写入
     
     def _update_statistics(self, task_data: Dict, old_status: str, new_status: str):
         """更新处理状态统计"""
@@ -1817,6 +1849,93 @@ class ZipMetadataAdder:
         # 复用翻译处理逻辑
         self.process_translation_only(task_id, num_threads)
     
+    def process_translation_only(self, task_id: str, num_threads: int = 5):
+        """仅处理翻译任务"""
+        task_data = self.task_manager.get_task(task_id)
+        
+        if not task_data:
+            logger.error(f'任务不存在: {task_id}')
+            return
+        
+        folder_path = Path(task_data['folder_path'])
+        
+        if not folder_path.exists():
+            logger.error(f'文件夹不存在: {folder_path}')
+            return
+        
+        # 获取需要翻译的文件
+        files_to_translate = self.task_manager.get_untranslated_files(task_id)
+        
+        if not files_to_translate:
+            logger.info('没有需要翻译的文件')
+            self.print_translation_summary(task_id)
+            return
+        
+        logger.info(f'开始翻译任务: {task_id}')
+        logger.info(f'文件夹路径: {folder_path}')
+        logger.info(f'待翻译文件数: {len(files_to_translate)}\n')
+        
+        # 注册信号处理函数
+        def signal_handler(signum, frame):
+            logger.warning('\n!!! 接收到退出信号 (Ctrl+C) !!!')
+            logger.warning('正在停止分发新任务，请等待当前正在运行的线程完成...')
+            self._shutdown_requested.set()
+
+        original_sigint_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal_handler)
+        
+        try:
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = {}
+                
+                for idx, filename in enumerate(files_to_translate):
+                    if self._shutdown_requested.is_set():
+                        logger.warning('已停止分发新任务。')
+                        break
+
+                    archive_path = folder_path / filename
+                    future = executor.submit(self._translate_single_file, task_id, str(archive_path), filename)
+                    futures[future] = filename
+                    
+                    # 延迟逻辑
+                    if (idx + 1) % num_threads == 0:
+                        start_sleep = time.time()
+                        while time.time() - start_sleep < 2.0:  # 默认2秒延迟
+                            if self._shutdown_requested.is_set():
+                                break
+                            time.sleep(0.1)
+                
+                # 等待任务完成，但响应退出信号
+                if futures:
+                    completed_futures = 0
+                    total_futures = len(futures)
+                    
+                    for future in as_completed(futures, timeout=1.0):  # 1秒超时
+                        try:
+                            future.result(timeout=5.0)  # 每个任务最多等待5秒
+                            completed_futures += 1
+                            if completed_futures % 10 == 0:  # 每完成10个任务报告一次进度
+                                logger.info(f'已完成 {completed_futures}/{total_futures} 个任务')
+                        except Exception as e:
+                            logger.error(f'处理异常: {e}')
+                        
+                        # 检查是否需要退出
+                        if self._shutdown_requested.is_set():
+                            logger.warning('检测到退出请求，正在清理...')
+                            # 取消未完成的任务
+                            for pending_future in futures:
+                                if not pending_future.done():
+                                    pending_future.cancel()
+                            break
+                
+        except TimeoutError:
+            logger.warning('任务等待超时')
+        except KeyboardInterrupt:
+            logger.warning('接收到键盘中断')
+            self._shutdown_requested.set()
+        
+        self.print_translation_summary(task_id)
+    
     def _translate_single_file(self, task_id: str, archive_path: str, filename: str) -> bool:
         """翻译单个文件"""
         with self._lock:
@@ -1929,6 +2048,9 @@ class ZipMetadataAdder:
                         self._shutdown_requested.set()
                 
         finally:
+            # 强制刷新所有缓存数据
+            self.task_manager.flush_all()
+            
             # 恢复原始信号处理
             signal.signal(signal.SIGINT, original_sigint_handler)
             if self._shutdown_requested.is_set():
@@ -2129,6 +2251,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=10, help='批处理大小，默认10个文件')
     parser.add_argument('--cache-size', type=int, default=50, help='内存缓存大小，默认50个文件')
     parser.add_argument('--batch-mode', action='store_true', help='启用批处理模式（减少磁盘I/O）')
+    parser.add_argument('--write-interval', type=int, default=50, help='缓存写入间隔，默认50次操作写入一次')
     
     args = parser.parse_args()
     
@@ -2257,8 +2380,9 @@ def main():
             if args.batch_size and args.batch_size > 0:
                 print(f"批处理大小: {args.batch_size} 个文件")
             
-            # 更新缓存大小
+            # 更新缓存大小和写入间隔
             adder.cache_manager.max_size = args.cache_size
+            task_manager.set_write_threshold(args.write_interval)
             
             if args.batch_mode:
                 # 使用批处理模式
